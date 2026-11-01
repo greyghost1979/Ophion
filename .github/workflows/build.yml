@@ -62,32 +62,62 @@ jobs:
             exit 1
           }
 
-          # Verify the MSVC compiler actually landed. Depending on the choco /
-          # chocolatey-visualstudio.extension versions, the package parameters
-          # can fail to reach the VS installer, leaving only the base shell
-          # (VCToolsInstallDir undefined -> cl.exe/ml64.exe not found). If that
-          # happens, drive the VS installer engine directly.
+          # --- Diagnostics -------------------------------------------------
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "Shell elevated: $elevated"
           $vsRoot  = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.Component.MSBuild -property installationPath
           if (-not $vsRoot) { Write-Error 'VS 2022 Build Tools not found after choco install'; exit 1 }
           Write-Host "VS Build Tools at: $vsRoot"
+          Write-Host "--- instance top-level directories:"
+          Get-ChildItem $vsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+          Write-Host "--- installed components (vswhere -include packages):"
+          & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -format json -include packages |
+            ConvertFrom-Json | ForEach-Object { $_.packages | Where-Object { $_.type -eq 'Workload' -or $_.id -like '*VC.Tools*' } } |
+            ForEach-Object { Write-Host "  $($_.id)" }
+          Write-Host "--- installer log tails:"
+          Get-ChildItem "$env:TEMP\dd_*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 4 |
+            ForEach-Object {
+              Write-Host "=== $($_.Name) (last 15 lines):"
+              Get-Content $_.FullName -Tail 15 | ForEach-Object { Write-Host "  $_" }
+            }
 
+          # --- Verify the MSVC compiler actually landed ---------------------
+          # Depending on the choco / chocolatey-visualstudio.extension versions,
+          # the package parameters can fail to reach the VS installer, leaving
+          # only the base shell (VCToolsInstallDir undefined -> cl.exe/ml64.exe
+          # not found). If that happens, run the VS bootstrapper directly.
           $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue
           if (-not $cl) {
-            Write-Host 'MSVC tools missing after choco install - running the VS installer engine directly...'
-            $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-            if (-not (Test-Path $setup)) { Write-Error "VS installer engine not found: $setup"; exit 1 }
-            & $setup modify --installPath $vsRoot `
+            Write-Host 'MSVC tools missing after choco install - running the VS bootstrapper directly...'
+            $bootstrapper = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
+            curl.exe -sSL -o $bootstrapper 'https://aka.ms/vs/17/release/vs_buildtools.exe'
+            if ($LASTEXITCODE -ne 0) { Write-Error 'failed to download vs_buildtools.exe'; exit 1 }
+            & $bootstrapper modify --installPath $vsRoot `
               --add Microsoft.VisualStudio.Workload.VCTools `
               --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              --quiet --norestart
-            # 3010 = success, reboot required
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
-              Write-Error "VS installer modify failed with exit code $LASTEXITCODE"
+              --quiet --norestart --wait --nocache
+            $vsExit = $LASTEXITCODE
+            Write-Host "vs_buildtools.exe modify exit code: $vsExit"
+            # 0 = success, 3010 = success + reboot, 740 = elevation required (should not happen)
+            if ($vsExit -ne 0 -and $vsExit -ne 3010) {
+              Write-Error "VS bootstrapper modify failed with exit code $vsExit"
               exit 1
             }
             $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue
-            if (-not $cl) { Write-Error 'MSVC tools still missing after direct VS installer modify'; exit 1 }
+            if (-not $cl) {
+              Write-Host '--- post-modify installer log tails:'
+              Get-ChildItem "$env:TEMP\dd_*.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime | Select-Object -Last 4 |
+                ForEach-Object {
+                  Write-Host "=== $($_.Name) (last 15 lines):"
+                  Get-Content $_.FullName -Tail 15 | ForEach-Object { Write-Host "  $_" }
+                }
+              Write-Error 'MSVC tools still missing after direct VS bootstrapper modify'
+              exit 1
+            }
           }
           Write-Host "MSVC compiler: $($cl.FullName)"
 
