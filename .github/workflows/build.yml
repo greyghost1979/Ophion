@@ -51,7 +51,7 @@ jobs:
       # ------------------------------------------------------------------
       # 1. Visual Studio 2022 Build Tools via chocolatey
       # ------------------------------------------------------------------
-      - name: Install VS 2022 Build Tools (choco)
+      - name: Install VS 2022 Build Tools (choco) and resolve build toolchain
         shell: pwsh
         run: |
           Write-Host 'Installing VS 2022 Build Tools with the VC tools workload...'
@@ -62,64 +62,59 @@ jobs:
             exit 1
           }
 
-          # --- Diagnostics -------------------------------------------------
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          Write-Host "Shell elevated: $elevated"
-          $vsRoot  = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.Component.MSBuild -property installationPath
-          if (-not $vsRoot) { Write-Error 'VS 2022 Build Tools not found after choco install'; exit 1 }
-          Write-Host "VS Build Tools at: $vsRoot"
-          Write-Host "--- instance top-level directories:"
-          Get-ChildItem $vsRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
-          Write-Host "--- installed components (vswhere -include packages):"
-          & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -format json -include packages |
-            ConvertFrom-Json | ForEach-Object { $_.packages | Where-Object { $_.type -eq 'Workload' -or $_.id -like '*VC.Tools*' } } |
-            ForEach-Object { Write-Host "  $($_.id)" }
-          Write-Host "--- installer log tails:"
-          Get-ChildItem "$env:TEMP\dd_*.log" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime | Select-Object -Last 4 |
-            ForEach-Object {
-              Write-Host "=== $($_.Name) (last 15 lines):"
-              Get-Content $_.FullName -Tail 15 | ForEach-Object { Write-Host "  $_" }
-            }
+          $btRoot = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.Component.MSBuild -property installationPath
+          Write-Host "VS Build Tools at: $btRoot"
 
-          # --- Verify the MSVC compiler actually landed ---------------------
-          # Depending on the choco / chocolatey-visualstudio.extension versions,
-          # the package parameters can fail to reach the VS installer, leaving
-          # only the base shell (VCToolsInstallDir undefined -> cl.exe/ml64.exe
-          # not found). If that happens, run the VS bootstrapper directly.
-          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue
-          if (-not $cl) {
-            Write-Host 'MSVC tools missing after choco install - running the VS bootstrapper directly...'
+          function Get-Cl([string]$root) {
+            if (-not $root) { return $null }
+            Get-ChildItem "$root\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+
+          # The choco / chocolatey-visualstudio.extension package parameters can
+          # fail to make the VS installer actually lay down the MSVC payload on
+          # GHA runners (the workload gets registered but no compiler files
+          # appear; Microsoft CDN MSI downloads are unreliable there). Retry once
+          # with the documented bootstrapper invocation, then verify on disk.
+          if (-not (Get-Cl $btRoot)) {
+            Write-Host 'MSVC tools missing after choco install - retrying with the VS bootstrapper directly...'
             $bootstrapper = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
             curl.exe -sSL -o $bootstrapper 'https://aka.ms/vs/17/release/vs_buildtools.exe'
             if ($LASTEXITCODE -ne 0) { Write-Error 'failed to download vs_buildtools.exe'; exit 1 }
-            & $bootstrapper modify --installPath $vsRoot `
+            & $bootstrapper modify --installPath $btRoot `
               --add Microsoft.VisualStudio.Workload.VCTools `
               --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              --quiet --norestart --wait --nocache
-            $vsExit = $LASTEXITCODE
-            Write-Host "vs_buildtools.exe modify exit code: $vsExit"
-            # 0 = success, 3010 = success + reboot, 740 = elevation required (should not happen)
-            if ($vsExit -ne 0 -and $vsExit -ne 3010) {
-              Write-Error "VS bootstrapper modify failed with exit code $vsExit"
-              exit 1
-            }
-            $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue
-            if (-not $cl) {
-              Write-Host '--- post-modify installer log tails:'
-              Get-ChildItem "$env:TEMP\dd_*.log" -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime | Select-Object -Last 4 |
-                ForEach-Object {
-                  Write-Host "=== $($_.Name) (last 15 lines):"
-                  Get-Content $_.FullName -Tail 15 | ForEach-Object { Write-Host "  $_" }
-                }
-              Write-Error 'MSVC tools still missing after direct VS bootstrapper modify'
-              exit 1
-            }
+              --quiet --norestart --wait --nocache 2>&1 | ForEach-Object { Write-Host "bootstrapper: $_" }
+            Write-Host "vs_buildtools.exe modify exit code: $LASTEXITCODE"
+            # 0 = success, 3010 = success + reboot; treat others as soft failure
+            # (the retry is best-effort - see fallback below)
           }
-          Write-Host "MSVC compiler: $($cl.FullName)"
+
+          if (Get-Cl $btRoot) {
+            $vsRoot = $btRoot
+            Write-Host 'Using the choco-installed VS Build Tools toolchain.'
+          }
+          else {
+            # Fall back to any VS instance on the runner that actually has the
+            # MSVC compiler (the hosted windows-2022 image ships VS 2022
+            # Enterprise with the complete C++ build tools).
+            Write-Host 'BuildTools has no MSVC compiler - resolving a VS instance that does...'
+            $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          }
+
+          if (-not $vsRoot) {
+            Write-Error 'No Visual Studio instance with the MSVC compiler (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) found on this runner.'
+            exit 1
+          }
+          $cl = Get-Cl $vsRoot
+          if (-not $cl) {
+            Write-Error "No cl.exe under $vsRoot\VC\Tools\MSVC - cannot build."
+            exit 1
+          }
+
+          Write-Host "Build VS instance : $vsRoot"
+          Write-Host "MSVC compiler     : $($cl.FullName)"
+          "VS_BUILD_ROOT=$vsRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # ------------------------------------------------------------------
       # 2. WDK + SDK via NuGet (NOT winget / MSI)
@@ -262,13 +257,13 @@ jobs:
       # 5. WindowsKernelModeDriver10.0 platform toolset inside VS Build Tools
       #    (the glue the WDK VSIX would normally install)
       # ------------------------------------------------------------------
-      - name: Install WindowsKernelModeDriver10.0 toolset into VS Build Tools
+      - name: Install WindowsKernelModeDriver10.0 toolset into VS
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.Component.MSBuild -property installationPath
-          if (-not $vsRoot) { Write-Error 'VS 2022 Build Tools not found'; exit 1 }
-          Write-Host "VS Build Tools: $vsRoot"
+          $vsRoot  = $env:VS_BUILD_ROOT
+          if (-not $vsRoot) { Write-Error 'VS_BUILD_ROOT is not set'; exit 1 }
+          Write-Host "VS instance: $vsRoot"
 
           $vct  = Join-Path $vsRoot 'MSBuild\Microsoft\VC\v170'
           $wdk  = Join-Path $env:GITHUB_WORKSPACE "packages\Microsoft.Windows.WDK.x64.$env:WDK_VERSION\c"
@@ -349,8 +344,8 @@ jobs:
       - name: Build Ophion.sln
         shell: pwsh
         run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products Microsoft.VisualStudio.Product.BuildTools -requires Microsoft.Component.MSBuild -property installationPath
+          $vsRoot = $env:VS_BUILD_ROOT
+          if (-not $vsRoot) { Write-Error 'VS_BUILD_ROOT is not set'; exit 1 }
           # 64-bit MSBuild is required: WindowsDriver.Common.targets derives tool
           # paths from the MSBuild process architecture (stampinf/TRK0005 issues
           # under the 32-bit host).
